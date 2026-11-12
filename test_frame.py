@@ -19,6 +19,10 @@ import frame_push as fp                                            # noqa: E402
 import app                                                         # noqa: E402
 from PIL import Image                                              # noqa: E402
 
+# Discovery also reads the kernel's ARP table directly. Point it at nothing by default so
+# the host's real neighbours can't leak into a test; tests that want it set their own.
+fp.ARP_PROC = os.path.join(_HOME, "no-such-proc-net-arp")
+
 # Anchor the fixture reads to the repo, not the caller's working directory.
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -265,17 +269,153 @@ class TestDiscoveryToolsMissing(unittest.TestCase):
             fp.subprocess.run = real
 
     def test_net_tools_missing_names_the_absent_commands(self):
-        real = fp.shutil.which
-        fp.shutil.which = lambda t: None
+        real = fp._which
+        fp._which = lambda t: None
         try:
             self.assertEqual(fp._net_tools_missing(), ["ping", "arp"])
         finally:
-            fp.shutil.which = real
-        fp.shutil.which = lambda t: "/usr/bin/ping" if t == "ping" else None
+            fp._which = real
+        fp._which = lambda t: "/usr/bin/ping" if t == "ping" else None
         try:
             self.assertEqual(fp._net_tools_missing(), ["arp"])
         finally:
-            fp.shutil.which = real
+            fp._which = real
+
+    def test_a_readable_proc_arp_stands_in_for_the_arp_command(self):
+        """No `arp` binary is fine on Linux: /proc/net/arp has the same table."""
+        path = os.path.join(tempfile.mkdtemp(), "arp")
+        open(path, "w").write("IP address HW type Flags HW address Mask Device\n")
+        real_which, real_proc = fp._which, fp.ARP_PROC
+        fp._which, fp.ARP_PROC = (lambda t: None), path
+        try:
+            self.assertEqual(fp._net_tools_missing(), ["ping"])
+        finally:
+            fp._which, fp.ARP_PROC = real_which, real_proc
+
+    def test_which_finds_sbin_tools_that_a_cron_path_misses(self):
+        """Bug: cron runs jobs with PATH=/usr/bin:/bin, and net-tools puts arp in /usr/sbin,
+        so every scheduled run failed with "no arp command" while the panel worked."""
+        d = tempfile.mkdtemp()
+        tool = os.path.join(d, "arp")
+        open(tool, "w").write("#!/bin/sh\n"); os.chmod(tool, 0o755)
+        real_which, real_sbin = fp.shutil.which, fp._SBIN
+        fp.shutil.which, fp._SBIN = (lambda t: None), (d,)
+        try:
+            self.assertEqual(fp._which("arp"), tool)
+            self.assertIsNone(fp._which("nope"))
+        finally:
+            fp.shutil.which, fp._SBIN = real_which, real_sbin
+
+
+class TestArpSources(unittest.TestCase):
+    """The MAC->IP table comes from /proc/net/arp, `ip neigh` or `arp -an`, whichever exist."""
+
+    MAC = "64:07:f6:3d:43:f0"
+
+    def setUp(self):
+        self.real = (fp.ARP_PROC, fp._which, fp.subprocess.run)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        fp.ARP_PROC, fp._which, fp.subprocess.run = self.real
+
+    def _no_commands(self):
+        fp._which = lambda t: None
+        fp.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("arp"))
+
+    def test_reads_proc_net_arp_without_any_command(self):
+        self._no_commands()
+        path = os.path.join(tempfile.mkdtemp(), "arp")
+        open(path, "w").write(
+            "IP address       HW type     Flags       HW address            Mask     Device\n"
+            "192.168.50.1     0x1         0x2         aa:bb:cc:dd:ee:ff     *        eno1\n"
+            "192.168.50.116   0x1         0x2         64:07:F6:3D:43:F0     *        eno1\n"
+            "192.168.50.99    0x1         0x0         64:07:f6:3d:43:f0     *        eno1\n")
+        fp.ARP_PROC = path
+        # 0x0 is an incomplete entry: not a real mapping, so it must not be offered
+        self.assertEqual(fp._arp_ips_for_mac(self.MAC), ["192.168.50.116"])
+
+    def test_reads_ip_neigh(self):
+        fp._which = lambda t: "/usr/sbin/ip" if t == "ip" else None
+
+        class R:
+            stdout = ""
+
+        def run(cmd, *a, **k):
+            r = R()
+            if cmd[0].endswith("ip"):
+                r.stdout = ("192.168.50.116 dev eno1 lladdr 64:07:f6:3d:43:f0 REACHABLE\n"
+                            "192.168.50.7 dev eno1 FAILED\n")
+            return r
+        fp.subprocess.run = run
+        self.assertEqual(fp._arp_ips_for_mac(self.MAC), ["192.168.50.116"])
+
+
+class TestWaitingForTheFrame(unittest.TestCase):
+    """No ping reply should mean "wait a bit", not "fail" — and a configured IP that answers
+    must win even when the MAC can't be confirmed from any ARP source."""
+
+    def setUp(self):
+        names = ("_reachable", "_port_open", "_arp_ips_for_mac", "_sweep", "resolve_frame_ip")
+        saved = {n: getattr(fp, n) for n in names}
+        real_sleep = fp.time.sleep
+        fp.time.sleep = lambda s: None
+        fp._sweep = lambda base: None
+        self.addCleanup(lambda: ([setattr(fp, n, f) for n, f in saved.items()],
+                                 setattr(fp.time, "sleep", real_sleep)))
+
+    def test_a_reachable_preferred_ip_is_used_when_arp_knows_nothing(self):
+        fp._reachable = lambda ip: ip == "192.168.50.116"
+        fp._port_open = lambda ip, *a, **k: False
+        fp._arp_ips_for_mac = lambda mac: []
+        self.assertEqual(fp.resolve_frame_ip("192.168.50.116", "64:07:f6:3d:43:f0"),
+                         "192.168.50.116")
+
+    def test_an_unreachable_preferred_ip_is_not_guessed(self):
+        fp._reachable = lambda ip: False
+        fp._port_open = lambda ip, *a, **k: False
+        fp._arp_ips_for_mac = lambda mac: []
+        self.assertIsNone(fp.resolve_frame_ip("192.168.50.116", "64:07:f6:3d:43:f0"))
+
+    def test_wait_returns_once_the_tv_answers(self):
+        answers = iter([False, False, True])
+        fp._reachable = lambda ip: next(answers, True)
+        fp._port_open = lambda ip, *a, **k: False
+        fp._arp_ips_for_mac = lambda mac: []
+        fp.resolve_frame_ip = lambda p, m: None
+        clock = iter(range(0, 10000, 5))
+        real_time = fp.time.time
+        fp.time.time = lambda: next(clock)
+        self.addCleanup(lambda: setattr(fp.time, "time", real_time))
+        self.assertEqual(fp.wait_for_frame("192.168.50.116", "64:07:f6:3d:43:f0", 120),
+                         "192.168.50.116")
+
+    def test_wait_gives_up_after_the_window(self):
+        fp._reachable = lambda ip: False
+        fp._port_open = lambda ip, *a, **k: False
+        fp._arp_ips_for_mac = lambda mac: []
+        fp.resolve_frame_ip = lambda p, m: None
+        clock = iter(range(0, 10000, 30))
+        real_time = fp.time.time
+        fp.time.time = lambda: next(clock)
+        self.addCleanup(lambda: setattr(fp.time, "time", real_time))
+        self.assertIsNone(fp.wait_for_frame("192.168.50.116", "64:07:f6:3d:43:f0", 90))
+
+    def test_locate_waits_before_reporting_not_found(self):
+        calls = []
+        fp.resolve_frame_ip = lambda p, m: None
+        real_wait, real_missing = fp.wait_for_frame, fp._net_tools_missing
+        fp.wait_for_frame = lambda p, m, s: (calls.append(s), "192.168.50.116")[1]
+        fp._net_tools_missing = lambda: []
+        self.addCleanup(lambda: (setattr(fp, "wait_for_frame", real_wait),
+                                 setattr(fp, "_net_tools_missing", real_missing)))
+        args = argparse.Namespace(mac="64:07:f6:3d:43:f0", ip="192.168.50.116", ping_wait=90)
+        self.assertEqual(fp.locate_frame(args), "192.168.50.116")
+        self.assertEqual(calls, [90])
+        calls.clear()
+        args.ping_wait = 0                                  # the watcher: no extra waiting
+        self.assertIsNone(fp.locate_frame(args))
+        self.assertEqual(calls, [])
 
     def test_every_missing_tool_maps_to_an_installable_package(self):
         for tool in ("ping", "arp"):
@@ -1210,6 +1350,42 @@ class TestStatusRoundTrip(TempState):
             self.assertEqual(got[k], v, f"pinning lost {k!r}")
 
 
+class TestWatcherKeepsWaiting(TempState):
+    """A push that dies mid-way (TV back to sleep, Wi-Fi blip) used to kill the watcher."""
+
+    def test_a_transient_push_error_is_retried(self):
+        fp.WATCH_PID = os.path.join(fp.CFG, "watcher.pid")
+        saved = (fp.tv_ready, fp.run, fp.time.sleep)
+        self.addCleanup(lambda: (setattr(fp, "tv_ready", saved[0]), setattr(fp, "run", saved[1]),
+                                 setattr(fp.time, "sleep", saved[2])))
+        fp.tv_ready = lambda ip, mac, deep=False: "192.168.50.116"
+        fp.time.sleep = lambda s: None
+        tries = []
+
+        def flaky(args):
+            tries.append(1)
+            if len(tries) < 2:
+                raise ConnectionResetError("websocket closed")
+            return "pushed"
+        fp.run = flaky
+        args = argparse.Namespace(ip="192.168.50.116", mac="64:07:f6:3d:43:f0", watch=True)
+        self.assertEqual(fp._watch_loop(args), "pushed")
+        self.assertEqual(len(tries), 2)
+        self.assertEqual(args.ping_wait, 0)
+
+    def test_a_persistent_error_still_surfaces(self):
+        fp.WATCH_PID = os.path.join(fp.CFG, "watcher.pid")
+        saved = (fp.tv_ready, fp.run, fp.time.sleep)
+        self.addCleanup(lambda: (setattr(fp, "tv_ready", saved[0]), setattr(fp, "run", saved[1]),
+                                 setattr(fp.time, "sleep", saved[2])))
+        fp.tv_ready = lambda ip, mac, deep=False: "192.168.50.116"
+        fp.time.sleep = lambda s: None
+        fp.run = lambda args: (_ for _ in ()).throw(RuntimeError("No images to upload."))
+        args = argparse.Namespace(ip="192.168.50.116", mac="64:07:f6:3d:43:f0", watch=True)
+        with self.assertRaises(RuntimeError):
+            fp._watch_loop(args)
+
+
 class TestWatcherPid(TempState):
     """Bug: a stale pid file whose pid had been recycled wedged every later run into
     "a watcher is already waiting"."""
@@ -1385,7 +1561,7 @@ class TestLogPath(unittest.TestCase):
         redirect or quoting problem that would stop the job before Python starts."""
         import subprocess
         app._log_dir_ready()
-        cmd = f"{app.PYTHON} {app.SCRIPT} --help >> {app.LOG} 2>&1"
+        cmd = f"PATH={app.CRON_PATH} {app.PYTHON} {app.SCRIPT} --help >> {app.LOG} 2>&1"
         r = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, f"the scheduled command could not run: {r.stderr}")
 
@@ -1689,6 +1865,48 @@ class TestPanelRoutes(TempState):
         app.platform.system = lambda: name
         self.addCleanup(lambda: setattr(app.platform, "system", real))
 
+    def _crontab_capture(self, existing=""):
+        written = []
+
+        def handler(cmd):
+            if cmd[:2] == ["crontab", "-l"]:
+                return NoServiceControl.Done(stdout=existing)
+            return NoServiceControl.Done()
+        real = app.subprocess.run
+
+        def fake(cmd, *a, **k):
+            if cmd[:2] == ["crontab", "-"]:
+                written.append(k.get("input", ""))
+            return handler(cmd)
+        app.subprocess.run = fake
+        self.addCleanup(lambda: setattr(app.subprocess, "run", real))
+        return written
+
+    def test_the_cron_line_carries_a_path_with_sbin(self):
+        """Bug: cron's PATH=/usr/bin:/bin hides /usr/sbin/arp from scheduled runs."""
+        self._forcing_platform("Linux")
+        written = self._crontab_capture()
+        app.write_schedule({"every": 1, "every_unit": "days", "time": "07:30"})
+        self.assertIn(f"PATH={app.CRON_PATH} ", written[-1])
+        self.assertIn("/usr/sbin", app.CRON_PATH)
+
+    def test_startup_restores_a_lost_schedule(self):
+        """Bug: a recreated container has an empty crontab, so the saved schedule never fired."""
+        self._forcing_platform("Linux")
+        app.save_config({"mac": "64:07:f6:3d:43:f0", "every": 1, "every_unit": "days", "time": "07:30"})
+        written = self._crontab_capture(existing="")
+        app.restore_schedule()
+        self.assertEqual(len(written), 1)
+        self.assertIn("30 7 * * *", written[0])
+
+    def test_startup_leaves_a_current_schedule_alone(self):
+        self._forcing_platform("Linux")
+        app.save_config({"mac": "64:07:f6:3d:43:f0"})
+        written = self._crontab_capture(
+            existing=f"30 7 * * * PATH={app.CRON_PATH} python frame_push.py  # frameart\n")
+        app.restore_schedule()
+        self.assertEqual(written, [])
+
     def test_save_reports_a_message_when_there_is_no_crontab(self):
         """Bug: the unguarded `crontab -` call made /save a 500 on any Linux host
         without cron — after the settings had already been written."""
@@ -1875,7 +2093,7 @@ class TestPanelRoutes(TempState):
             self.client.post("/wipe", json={"confirm": True})
         finally:
             app.run_push = real
-        self.assertEqual(calls[0], ["--wipe", "--mac", "a0:d0:5b:a0:e9:89"])
+        self.assertEqual(calls[0], ["--wipe", "--mac", "a0:d0:5b:a0:e9:89", "--ping-wait", "30"])
 
     def test_wipe_refuses_without_a_mac(self):
         app.save_config({"mac": ""})

@@ -235,7 +235,7 @@ DEFAULTS = {"mac": "", "ip": None, "description": "made-up", "content": "museum"
             "seasonal_chance": 0.0, "holidays_chance": 0.0, "weather_chance": 0.0, "on_this_day_chance": 0.0,
             "googly": False, "googly_chance": 0.0, "googly_strictness": 0.5,
             "latitude": None, "longitude": None, "tone_weights": {},
-            "watch_on_fail": True, "watch_interval": 60, "watch_timeout": 180,
+            "watch_on_fail": True, "watch_interval": 60, "watch_timeout": 180, "ping_wait": 90,
             "fill": True, "fill_tolerance": 0.2, "fill_mat": True, "max_upscale": 1.6,
             "exclude_terms": ["church", "temple", "cathedral", "mosque", "protest", "homeless", "portrait"],
             "layout_version": 2}
@@ -437,6 +437,59 @@ def _norm_mac(mac):
         return None
     return ":".join(p.zfill(2) for p in parts)
 
+# Where the ARP/neighbour table can be read. /proc/net/arp needs no binary at all, which
+# matters because cron runs jobs with PATH=/usr/bin:/bin and net-tools installs `arp` in
+# /usr/sbin — scheduled runs failed with "no arp command" while the panel worked.
+ARP_PROC = "/proc/net/arp"
+_SBIN = ("/usr/sbin", "/sbin", "/usr/local/sbin", "/usr/bin", "/bin")
+
+def _which(tool):
+    """Absolute path of `tool`, also looking in the sbin dirs a cron PATH leaves out."""
+    found = shutil.which(tool)
+    if found:
+        return found
+    for d in _SBIN:
+        cand = os.path.join(d, tool)
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+def _proc_arp_readable():
+    try:
+        with open(ARP_PROC):
+            return True
+    except Exception:
+        return False
+
+def _arp_table_text():
+    """Every source of IP<->MAC pairs we can get, as text lines in a shape the parser below
+    understands: /proc/net/arp (Linux, no binary), `ip neigh`, then `arp -an`."""
+    lines = []
+    try:                                             # IP  HWtype  Flags  HWaddress  Mask  Device
+        with open(ARP_PROC) as f:
+            for row in f.read().splitlines()[1:]:
+                cols = row.split()
+                if len(cols) >= 4 and cols[2] != "0x0":  # 0x0 = incomplete entry
+                    lines.append(f"? ({cols[0]}) at {cols[3]}")
+    except Exception:
+        pass
+    ip_cmd = _which("ip")
+    if ip_cmd:
+        try:                                         # 192.168.1.5 dev eth0 lladdr aa:bb:... REACHABLE
+            out = subprocess.run([ip_cmd, "neigh", "show"], capture_output=True, text=True, timeout=10).stdout
+            for row in out.splitlines():
+                cols = row.split()
+                if cols and "lladdr" in cols and "FAILED" not in cols:
+                    lines.append(f"? ({cols[0]}) at {cols[cols.index('lladdr') + 1]}")
+        except Exception:
+            pass
+    try:
+        out = subprocess.run([_which("arp") or "arp", "-an"], capture_output=True, text=True, timeout=10).stdout
+        lines.extend(out.splitlines())
+    except Exception:
+        pass                                         # no `arp` command (see _net_tools_missing)
+    return "\n".join(lines)
+
 def _arp_ips_for_mac(mac):
     """Every IP the ARP table maps to `mac`, best candidate first. One device commonly has
     two entries — a routable lease and a self-assigned 169.254.x link-local — and the
@@ -446,12 +499,8 @@ def _arp_ips_for_mac(mac):
     want = _norm_mac(mac)
     if not want:
         return []
-    try:
-        out = subprocess.run(["arp", "-an"], capture_output=True, text=True, timeout=10).stdout
-    except Exception:
-        return []                                    # no `arp` command (see _net_tools_missing)
     ips = []
-    for line in out.splitlines():
+    for line in _arp_table_text().splitlines():
         m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\)", line)
         if not m:
             continue
@@ -470,16 +519,53 @@ _PING = ["ping", "-c1"] + (["-t", "1"] if platform.system() == "Darwin" else ["-
 
 def _net_tools_missing():
     """Which discovery commands this machine hasn't got. Slim containers (python:*-slim) and
-    minimal distros ship neither; without them a MAC can't be mapped to an IP at all."""
-    return [t for t in ("ping", "arp") if not shutil.which(t)]
+    minimal distros ship neither; without them a MAC can't be mapped to an IP at all.
+    A readable /proc/net/arp stands in for `arp`, and the UDP sweep stands in for `ping`
+    when it comes to filling the table, so only a machine with neither source is stuck."""
+    missing = [t for t in ("ping", "arp") if not _which(t)]
+    if "arp" in missing and (_proc_arp_readable() or _which("ip")):
+        missing.remove("arp")
+    return missing
 
 APT_FOR = {"ping": "iputils-ping", "arp": "net-tools"}
 
+def _ping_cmd():
+    return [_which("ping") or "ping"] + _PING[1:]
+
 def _reachable(ip):
     try:
-        return subprocess.run(_PING + [ip], capture_output=True).returncode == 0
+        return subprocess.run(_ping_cmd() + [ip], capture_output=True, timeout=5).returncode == 0
     except Exception:
         return False                                 # no `ping` command — fall back to ARP
+
+def _alive(ip):
+    """Ping, or failing that the art port: some networks drop ICMP, and a missing `ping`
+    shouldn't make a perfectly reachable TV look gone."""
+    return bool(ip) and (_reachable(ip) or _port_open(ip))
+
+def _sweep(base):
+    """Touch every host on base.0/24 so the kernel fills its ARP table. Pings in parallel;
+    without `ping`, a UDP datagram to the discard port triggers the same ARP request."""
+    ping = _which("ping")
+    if ping:
+        procs = [subprocess.Popen(_ping_cmd() + [f"{base}.{i}"],
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for i in range(1, 255)]
+        for p in procs:
+            try:
+                p.wait(timeout=10)
+            except Exception:
+                p.kill()
+        return
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            for i in range(1, 255):
+                try:
+                    s.sendto(b"", (f"{base}.{i}", 9))
+                except Exception:
+                    pass
+        time.sleep(2)                                # let the replies land in the table
+    except Exception:
+        pass
 
 def resolve_frame_ip(preferred, mac):
     # trust preferred only if it actually answers and maps to the MAC (it may not be the
@@ -488,11 +574,7 @@ def resolve_frame_ip(preferred, mac):
         return preferred
     # otherwise sweep to populate the ARP table, then take a *reachable* ARP match
     base = ".".join((preferred or "192.168.1.1").split(".")[:3])
-    if shutil.which("ping"):
-        procs = [subprocess.Popen(_PING + [f"{base}.{i}"],
-                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for i in range(1, 255)]
-        for p in procs:
-            p.wait()
+    _sweep(base)
     # Actually verify, which this never did despite the comment above: a MAC with both a
     # lease and a link-local entry could hand back the address that can't be connected to.
     # A Frame in standby still answers ping even with its art port shut, so ping is enough.
@@ -500,7 +582,36 @@ def resolve_frame_ip(preferred, mac):
     for ip in candidates:
         if _port_open(ip) or _reachable(ip):
             return ip
-    return candidates[0] if candidates else None
+    if candidates:
+        return candidates[0]
+    # The MAC isn't in any table we can read (no ARP source, a routed/VPN hop, a Docker
+    # bridge...). A configured IP that answers is still the best guess — better than
+    # reporting a TV that's sitting right there as "not found".
+    if preferred and _alive(preferred):
+        return preferred
+    return None
+
+def wait_for_frame(preferred, mac, seconds, step=10):
+    """Fallback when the TV doesn't answer ping: keep looking for up to `seconds` instead of
+    failing at once — a Frame waking from deep standby, a Wi-Fi reconnect or a DHCP renew
+    takes a little while. Re-sweeps the subnet every few tries. The IP, or None."""
+    deadline = time.time() + max(0, seconds)
+    tries = 0
+    while time.time() < deadline:
+        time.sleep(min(step, max(1, deadline - time.time())))
+        tries += 1
+        if _alive(preferred):
+            return preferred
+        ips = _arp_ips_for_mac(mac)
+        for ip in ips:
+            if _alive(ip):
+                return ip
+        if tries % 3 == 0:
+            ip = resolve_frame_ip(preferred, mac)
+            if ip and _alive(ip):
+                return ip
+        print(f"  no answer from the Frame yet, waiting ({int(max(0, deadline - time.time()))}s left)...")
+    return None
 
 # ---------- wake + art-channel readiness ----------
 def wake(mac):
@@ -535,6 +646,8 @@ def ensure_art_ready(art, mac, wait, retries):
 # ---------- auto-watch: when the TV is asleep, retry the push once it wakes ----------
 WATCH_PID = os.path.join(CFG, "watcher.pid")
 WATCH_LOG = os.path.join(CFG, "watcher.log")
+
+WATCH_MAX_ERRORS = 3                                     # failed pushes before the watcher gives up
 
 class _Unreachable(RuntimeError):
     """The push can't happen right now — TV asleep, off the LAN, or being watched."""
@@ -637,6 +750,7 @@ def _watch_loop(args):
     # someone accepting the on-TV pairing prompt) — more than a snappy foreground run.
     args.retries = max(int(getattr(args, "retries", 4) or 4), 6)
     args.wake_wait = max(int(getattr(args, "wake_wait", 12) or 12), 15)
+    args.ping_wait = 0                                   # this loop does its own waiting
     interval = max(10, int(getattr(args, "watch_interval", 60) or 60))
     mins = max(1, int(getattr(args, "watch_timeout", 180) or 180))
     deadline = time.time() + mins * 60
@@ -647,9 +761,14 @@ def _watch_loop(args):
         pass
     write_status(False, "Waiting for the TV to be free (awake, not being watched), then it'll change the art.", {"waiting": True})
     i = 0
+    errors = 0
     try:
         while time.time() < deadline:
-            ip = tv_ready(args.ip, args.mac, deep=(i % 5 == 0))
+            try:
+                ip = tv_ready(args.ip, args.mac, deep=(i % 5 == 0))
+            except Exception as e:                       # a discovery hiccup must not kill the watcher
+                print(f"  ! probe failed: {str(e)[:120]}")
+                ip = None
             if ip:
                 args.ip = ip
                 print("TV art channel is up — trying the push.")
@@ -657,6 +776,14 @@ def _watch_loop(args):
                     return run(args)
                 except _Unreachable as e:
                     print(f"  deferred: {e}")            # asleep again, or being watched; keep waiting
+                except Exception as e:
+                    # The TV dropping off mid-upload (going back to sleep, Wi-Fi blip) surfaces
+                    # as a socket/websocket error. Wait and try again, but don't spin forever
+                    # on something that isn't the network (no images, bad settings...).
+                    errors += 1
+                    print(f"  ! push failed ({errors}/{WATCH_MAX_ERRORS}): {str(e)[:160]}")
+                    if errors >= WATCH_MAX_ERRORS:
+                        raise
             i += 1
             time.sleep(interval)
         gave = "Gave up — the TV didn't wake within the watch window."
@@ -676,11 +803,16 @@ def locate_frame(args):
                            "the environment. Find it on the Frame under About This TV, or your router.")
     print("Locating the Frame...")
     ip = resolve_frame_ip(args.ip, args.mac)
+    wait = int(getattr(args, "ping_wait", 0) or 0)
+    if not ip and wait > 0 and "arp" not in _net_tools_missing():
+        # No ping reply: don't give up straight away, the TV may just be slow to wake.
+        print(f"No answer from the Frame — waiting up to {wait}s for it to show up...")
+        ip = wait_for_frame(args.ip, args.mac, wait)
     if ip:
         print(f"Frame at {ip}")
         return ip
     missing = _net_tools_missing()
-    if missing:
+    if "arp" in missing:                             # no way to map MAC -> IP; retrying won't help
         raise RuntimeError(
             f"Can't locate the Frame: this machine has no {' or '.join(missing)} command, "
             "which is how a MAC address is mapped to an IP. Install it (Debian/Ubuntu: "
@@ -2256,6 +2388,9 @@ def main():
                     help="if the TV is asleep, keep retrying in the background until it wakes")
     ap.add_argument("--watch-interval", dest="watch_interval", type=int, default=cfg.get("watch_interval", 60),
                     help="seconds between polls while waiting for the TV")
+    ap.add_argument("--ping-wait", dest="ping_wait", type=int, default=cfg.get("ping_wait", 90),
+                    help="seconds to keep looking for the TV when it doesn't answer ping, before "
+                         "handing off to the background watcher (0 = don't wait)")
     ap.add_argument("--watch-timeout", dest="watch_timeout", type=int, default=cfg.get("watch_timeout", 180),
                     help="minutes to keep waiting for the TV before giving up")
     args = ap.parse_args()

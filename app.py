@@ -217,6 +217,25 @@ def _log_dir_ready():
     except Exception:
         return False
 
+CRON_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+def restore_schedule():
+    """Put the saved schedule back if the crontab lost it. In a container the crontab lives
+    in the image's /var/spool, not the config volume, so every recreate silently dropped the
+    daily job until someone pressed Save again."""
+    if platform.system() != "Linux" or not os.path.exists(fp.CONFIG):
+        return
+    try:
+        existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    except Exception:
+        return                                       # no cron here; write_schedule says so on Save
+    if "# frameart" in existing and f"PATH={CRON_PATH}" in existing:
+        return
+    try:
+        print("Schedule: " + write_schedule(fp.load_config()))
+    except Exception as e:
+        print(f"Schedule: couldn't restore it ({str(e)[:120]})")
+
 def write_schedule(cfg):
     """Regenerate + reload the recurring job for any interval (launchd on macOS, cron on Linux)."""
     interval, n, unit = schedule_of(cfg)
@@ -258,7 +277,9 @@ def write_schedule(cfg):
     if sysname == "Linux":
         spec, effective, actual = cron_spec(interval, hh, mm)
         tag = "# frameart"
-        line = f"{spec} {PYTHON} {SCRIPT} >> {LOG} 2>&1  {tag}"
+        # cron hands jobs PATH=/usr/bin:/bin, which misses /usr/sbin (arp, ip) — give the
+        # job the same PATH an interactive shell has, so a scheduled run finds the TV too.
+        line = f"{spec} PATH={CRON_PATH} {PYTHON} {SCRIPT} >> {LOG} 2>&1  {tag}"
         try:
             existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout.splitlines()
         except Exception:
@@ -474,7 +495,7 @@ def wipe():
     cfg = fp.load_config()
     if not cfg.get("mac"):
         return jsonify(ok=False, message="No TV MAC set — add it under Advanced first.")
-    base = ["--wipe", "--mac", cfg["mac"]]
+    base = ["--wipe", "--mac", cfg["mac"], "--ping-wait", "30"]   # stay inside the request timeout
     confirmed = bool(body.get("confirm"))
 
     r, err = run_push(base if confirmed else base + ["--dry-run"],
@@ -948,5 +969,6 @@ if __name__ == "__main__":
     ap.add_argument("--host", default="0.0.0.0")
     a = ap.parse_args()
     threading.Thread(target=_files_watchdog, daemon=True).start()   # alert if the folder gets evicted
+    restore_schedule()
     print(f"The Frame Machine control panel on http://{platform.node()}.local:{a.port}  (Ctrl-C to stop)")
     app.run(host=a.host, port=a.port)
